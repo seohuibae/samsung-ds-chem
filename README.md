@@ -1,4 +1,7 @@
 # Samsung-DS-Chemical
+## Goal
+data 가 부족한 소재 물성(CTE,k)의 예측 모델 개발 (imbalance label, noisy label) 
+
 ## Dataset 
 PolyInfo 
 
