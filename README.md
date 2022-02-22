@@ -17,5 +17,5 @@ python main_train_single_tuning_gcn.py --num_layers 6 --hidden_dim 200 --dropout
 ### multi-task
 python main_train_multiheads_tuning_gcn.py --num_layers 6 --hidden_dim 200 --dropout 0.1 --lr 5e-04 --ft_lr 5e-04 --l2reg 1e-02 --mlp_dropout 0.1 --mlp_dims 200 --model GCN --k_fold 5 --epochs 300 --ft_epochs 100 --gpu 0
 
-### reference 
+## reference 
 [1] Predicting Materials Properties with Little Data Using Shotgun Transfer Learning (ACS Cent. Sci. 2019, 5, 1717−1730)
