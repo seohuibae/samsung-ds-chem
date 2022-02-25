@@ -41,27 +41,20 @@ class GCN(torch.nn.Module):
 
         return pred
     
-    def loss_cl(self, x1, x2):
-        T = 0.1 
-        batch_size, _ = x1.size()
-        x1_abs = x1.norm(dim=1)
-        x2_abs = x2.norm(dim=1)
+    def base_params(self):
+        return self.layers.parameters()
 
-        sim_matrix = torch.einsum('ik,jk->ij', x1, x2) / torch.einsum('i,j->ij', x1_abs, x2_abs)
-        sim_matrix = torch.exp(sim_matrix / T)
-        pos_sim = sim_matrix[range(batch_size), range(batch_size)]
-        loss = pos_sim / (sim_matrix.sum(dim=1) - pos_sim)
-        loss = - torch.log(loss).mean()
-        
-        return loss
+    def classifier_params(self):
+        return self.mlp_head.parameters()
 
     def __repr__(self):
         return self.__class__.__name__
     
+    
 
-class GCNwoFC(torch.nn.Module):        
-    def __init__(self, num_input_features, num_layers, hidden_dim, out_dim=4, dropout=0.1, readout='mean', mlp_dropout=None):
-        super(GCNwoFC, self).__init__()
+class GCNwoRegressor(torch.nn.Module):        
+    def __init__(self, num_input_features, num_layers, hidden_dim, out_dim, dropout=0.1, readout='mean', mlp_dropout=None):
+        super(GCNwoRegressor, self).__init__()
         self.num_layers = num_layers
         self.dropout = dropout
         self.readout = readout 

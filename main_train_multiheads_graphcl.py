@@ -17,7 +17,7 @@ from models.gcn import GCN
 from models.gat import GAT
 from models.gin import GIN 
 # from models.transformer import Transformer, SimpleTextClassificationModel
-from dataset import set_dataset
+from dataset import set_dataset, molecule_aug
 
 from dataset import wrapper_for_collate_batch
 # from deepchem.feat.smiles_tokenizer import SmilesTokenizer, BasicSmilesTokenizer
@@ -29,11 +29,11 @@ parser = argparse.ArgumentParser(description='PyTorch Training')
 
 parser.add_argument('--batch_size', default=64, type=int)
 parser.add_argument('--epochs', default=300, type=int)                   
-parser.add_argument('--ft_epochs', default=100, type=int)
+parser.add_argument('--ft_epochs', default=50, type=int)
 parser.add_argument('--lr', default=1e-3, type=float)
 parser.add_argument('--ft_lr', default=1e-3, type=float)
 parser.add_argument('--l2reg', default=1e-03, type=float) # 1e-02~1e-03 
-parser.add_argument('--model', default='GCN', type=str, choices=['simple','transformer', 'GCN', 'GAT', 'GIN'])
+parser.add_argument('--model', default='GCN', type=str, choices=['GCN', 'GAT', 'GIN'])
 parser.add_argument('--gpu', default=0, type=int) # 0,1,2,3,
 parser.add_argument('--finetune_only', action='store_true' )
 # parser.add_argument('--tuning', action='store_true')
@@ -42,12 +42,20 @@ parser.add_argument('--seed', default=2020, type=int)
 
 # model related
 # parser.add_argument('--model_path', type=str, required=True)
+parser.add_argument('--exp', type=str, default='')
 parser.add_argument('--num_layers', type=int, required=True)
 parser.add_argument('--hidden_dim', type=int, required=True)
 #parser.add_argument('--heads', type=int, required=True)
 parser.add_argument('--dropout', type=float, required=True)
 parser.add_argument('--mlp_dropout', required=True)
 parser.add_argument('--mlp_dims', required=True)
+
+# augmentations
+parser.add_argument('--aug1', type=str, default='none', choices=['none', 'dropN', 'permE', 'maskN', 'subgraph', 'random'])
+parser.add_argument('--aug2', type=str, default='none', choices=['none', 'dropN', 'permE', 'maskN', 'subgraph', 'random'])
+parser.add_argument('--aug_ratio1', type=float, default=0.)
+parser.add_argument('--aug_ratio2', type=float, default=0.)
+
 args = parser.parse_args()
 
 if args.mlp_dropout=='None': 
@@ -108,16 +116,21 @@ def main(args):
         # vocab_path = os.path.join(vocab_rootdir,'vocab.txt')
         # tokenizer = SmilesTokenizer(vocab_path)
         
-        ### TODO 5-fold 
-        if args.model in ['simple', 'transformer']:
-            train_dataset, test_sets = set_dataset(root='./polyinfo/raw', test_idx=test_idx, use_smiles_only=True, k_fold=args.k_fold) 
-        else: 
-            train_dataset, test_sets = set_dataset(root='./polyinfo/raw', test_idx=test_idx, k_fold=args.k_fold)
+        from copy import deepcopy
+        from random import shuffle
+        train_dataset1, test_sets = set_dataset(root='./polyinfo/raw', test_idx=test_idx, k_fold=args.k_fold)
+        shuffle(train_dataset1)
+        train_dataset2 = deepcopy(train_dataset1)
 
-        if args.model in ['simple', 'transformer']:
-            train_loader = DataLoaderText(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=wrapper_for_collate_batch(tokenizer))
-        else:
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        if args.aug1 != 'none' :
+            assert args.aug_ratio1 !=0 
+            train_dataset1 = [molecule_aug(data, args.aug1, args.aug_ratio1) for data in train_dataset1]
+        if args.aug2 != 'none':
+            assert args.aug_ratio2 !=0 
+            train_dataset2 = [molecule_aug(data, args.aug2, args.aug_ratio2) for data in train_dataset2]
+
+        train_loader1 = DataLoader(train_dataset1, batch_size=args.batch_size, shuffle=False)
+        train_loader2 = DataLoader(train_dataset2, batch_size=args.batch_size, shuffle=False)
             
         model_dict = {
             'GCN': GCN(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout,  mlp_dropout=args.mlp_dropout, mlp_dims=mlp_dims),
@@ -130,9 +143,9 @@ def main(args):
             optimizer = build_optimizer(model, 'sparseadam', args.lr) 
         else: 
             optimizer = build_optimizer(model, 'adam', args.lr)
-
-        criterion = nn.MSELoss()
         
+        criterion = nn.MSELoss()
+
         if not os.path.exists(f'./graphcl-{args.model}'):
             os.mkdir(f'./graphcl-{args.model}')
 
@@ -141,7 +154,7 @@ def main(args):
         #     model_path.append(str(k)+str(v))
         # model_path = '-'.join(model_path)
         # model_path = args.model_path
-        hparams = {'nlayers': args.num_layers, 'dim': args.hidden_dim,'lr': args.lr, 'ft_lr':args.ft_lr, 'dropout': args.dropout, 'mlp_dropout': args.mlp_dropout, 'mlp_dims': args.mlp_dims,'kfold': args.k_fold}
+        hparams = {'nlayers': args.num_layers, 'dim': args.hidden_dim,'lr': args.lr, 'ft_lr':args.ft_lr, 'dropout': args.dropout, 'mlp_dropout': args.mlp_dropout, 'mlp_dims': args.mlp_dims,'kfold': args.k_fold, 'aug1': args.aug1, 'aug_ratio1': args.aug_ratio1, 'aug2': args.aug2, 'aug_ratio2': args.aug_ratio2 }
         model_path = []
         for k,v in hparams.items():
             model_path.append(str(k)+str(v))
@@ -160,38 +173,24 @@ def main(args):
         print("pretrain: ", not args.finetune_only)
         if args.finetune_only:
             print('load pre-trained model')
-            model.load_state_dict(torch.load(f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-{test_idx}.pth.tar'))
+            model.load_state_dict(torch.load(f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-{args.epochs}-{test_idx}.pth.tar'))
         else: 
             print('start pre-training')
             for epoch in range(args.epochs):
                 model.train()
 
                 training_loss = []
-                for batch in tqdm(train_loader):
-                    if args.model in ['simple', 'transformer']:
-                        cls, text, offsets = batch 
-                        cls, text, offsets = cls.to(device), text.to(device), offsets.to(device)
-                        bsz = len(cls)
-                        pred = model(text, offsets)
-                        _y = cls
-    
-                    else: 
-                        bsz = batch.num_graphs
-                        batch.to(device)  
-                        pred = model(batch)        
-                        _y = batch.y                           # pred: [bsz, 4]
-                    
-                    y  = torch.tensor([val[0] for val in _y]).float().to(device)
-                    y_idx = torch.tensor([val[1] for val in _y]).long().to(device)
-                    y_mean  = torch.tensor([val[2] for val in _y]).float().to(device)
-                    # y_std  = torch.tensor([val[3] for val in batch.y]).float()
-                    if args.model == 'transformer':
-                        pred = pred.view(-1, 4)
-                    pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
-                    pred = pred.squeeze(0)
+                for batch in tqdm(zip(train_loader1, train_loader2)):
+                    batch1, batch2 = batch 
 
-                    loss = scaled_l2(pred, y, y_mean)
-                    # loss = criterion(pred, y)
+                    bsz = batch1.num_graphs
+                    batch1.to(device)  
+                    batch2.to(device)
+
+                    pred1 = model.forward(batch1)
+                    pred2 = model.forward(batch2)     
+                    loss = model.loss_cl(pred1, pred2)
+
                     training_loss.append(loss.item())
                     
                     optimizer.zero_grad()
@@ -205,8 +204,9 @@ def main(args):
                 res['loss'] = np.mean(training_loss)
                 # print(res)
                 dict2tsv(res, f'./graphcl-{args.model}/{model_path}/{args.seed}/logs_pretrain-{test_idx}.txt')
-            torch.save(model.state_dict(), f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-{test_idx}.pth.tar')
-            
+                if (epoch+1)%100==0: 
+                    torch.save(model.state_dict(), f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-{epoch+1}-{test_idx}.pth.tar')
+            torch.save(model.state_dict(), f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-last-{test_idx}.pth.tar')
         ######
         # model = GCN(num_input_features=9, num_layers=3, hidden_dim=64, out_dim=64)
         # model = model.to(device)
@@ -223,16 +223,13 @@ def main(args):
             print(f'{k}/{total_test_iter} folds')
             ft_dataset, test_dataset = test_sets[k]
 
-            if args.model in ['simple', 'transformer']:
-                ft_loader = DataLoaderText(ft_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=wrapper_for_collate_batch(tokenizer))
-                test_loader = DataLoaderText(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=wrapper_for_collate_batch(tokenizer))
-            else: 
-                ft_loader = DataLoader(ft_dataset, batch_size=args.batch_size, shuffle=True)
-                test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+            ft_loader = DataLoader(ft_dataset, batch_size=args.batch_size, shuffle=True)
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
             # fine-tune
             for epoch in range(args.ft_epochs):
                 model.train()
+                
                 training_loss = []
                 for batch in tqdm(ft_loader):
                     if args.model in ['simple', 'transformer']:
@@ -269,7 +266,7 @@ def main(args):
                 res = collections.OrderedDict()
                 res['epoch'] = epoch
                 res['loss'] = np.mean(training_loss)
-                dict2tsv(res, f'./multi-{args.model}/{model_path}/{args.seed}/logs_finetune-{test_idx}.txt')
+                dict2tsv(res, f'./graphcl-{args.model}/{model_path}/{args.seed}/logs_finetune-{test_idx}.txt')
             
             # test 
             model.eval()
@@ -278,24 +275,14 @@ def main(args):
             preds = []
             with torch.no_grad():
                 for batch in tqdm(test_loader):
-                    if args.model in ['simple', 'transformer']:
-                        cls, text, offsets = batch 
-                        cls, text, offsets = cls.to(device), text.to(device), offsets.to(device)
-                        bsz = len(cls)
-                        pred = model(text, offsets)                    
-                        _y = cls
-
-                    else: 
-                        bsz = batch.num_graphs
-                        batch.to(device)  
-                        pred = model(batch)        
-                        _y = batch.y                           # pred: [bsz, 4]
+                    
+                    bsz = batch.num_graphs
+                    batch.to(device)  
+                    pred = model(batch)        
+                    _y = batch.y                           # pred: [bsz, 4]
                     
                     y  = torch.tensor([val[0] for val in _y]).float().to(device)
                     y_idx = torch.tensor([val[1] for val in _y]).long().to(device)
-
-                    if args.model == 'transformer':
-                        pred = pred.view(-1, 4)
                 
                     pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
                     pred = pred.squeeze(0)
