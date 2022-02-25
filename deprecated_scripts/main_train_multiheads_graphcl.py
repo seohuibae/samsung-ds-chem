@@ -1,5 +1,5 @@
 '''
-code for cl pretrain + finetune
+code for multi-heads + scaling 
 '''
 import os 
 import argparse
@@ -13,18 +13,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader as DataLoaderText
 from torch_geometric.data import DataLoader
 
-from models.gcn import GCN, GCNwoRegressor
-from models.gat import GAT, GATwoRegressor
-from models.gin import GIN, GINwoRegressor
-from models.model_utils import MLPReadout2
-from models.model import Model 
+from models.gcn import GCN
+from models.gat import GAT
+from models.gin import GIN 
 # from models.transformer import Transformer, SimpleTextClassificationModel
 from dataset import set_dataset, molecule_aug
 
 from dataset import wrapper_for_collate_batch
 # from deepchem.feat.smiles_tokenizer import SmilesTokenizer, BasicSmilesTokenizer
 from utils import dict2tsv, MultipleOptimizer, set_seed
-from train_utils import scaled_l2, mse, loss_cl
 
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
@@ -42,18 +39,16 @@ parser.add_argument('--finetune_only', action='store_true' )
 # parser.add_argument('--tuning', action='store_true')
 parser.add_argument('--k_fold', default=None, type=int) # 5 
 parser.add_argument('--seed', default=2020, type=int)
-parser.add_argument('--patience', default=100)
 
 # model related
 # parser.add_argument('--model_path', type=str, required=True)
 parser.add_argument('--exp', type=str, default='')
 parser.add_argument('--num_layers', type=int, required=True)
 parser.add_argument('--hidden_dim', type=int, required=True)
-parser.add_argument('--heads', type=int, default=1) 
+#parser.add_argument('--heads', type=int, required=True)
 parser.add_argument('--dropout', type=float, required=True)
 parser.add_argument('--mlp_dropout', required=True)
 parser.add_argument('--mlp_dims', required=True)
-# parser.add_argument('--bn', action='store_true')
 
 # augmentations
 parser.add_argument('--aug1', type=str, default='none', choices=['none', 'dropN', 'permE', 'maskN', 'subgraph', 'random'])
@@ -79,28 +74,11 @@ else:
     args.l2reg = float(args.l2reg)
 
 
-# if val_acc > best_val_acc:
-#             curr_step = 0
-#             best_epoch = epoch
-#             best_val_acc = val_acc
-#             best_val_loss= val_loss
-#             if val_acc>best_val_acc_trail:
-#                 best_test_acc = test_acc
-#                 best_test_auc = test_auc 
-#                 best_test_f1 = test_f1
-#                 best_val_acc_trail = val_acc
-#         else:
-#             curr_step +=1
-#         print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(cross_loss),"val_loss=", "{:.5f}".format(val_loss),
-#         "train_acc=", "{:.5f}".format(train_acc), "val_acc=", "{:.5f}".format(val_acc),"best_val_acc_trail=", "{:.5f}".format(best_val_acc_trail),
-#         "best_test_acc=", "{:.5f}".format(best_test_acc))
-
-#         if curr_step > args.early_stop:
-#             # print("Early stopping...")
-#             break
-
 # assert args.tuning 
 device = torch.device("cuda:"+str(args.gpu) if torch.cuda.is_available() else "cpu")
+
+def scaled_l2(pred, y, scale):
+    return ((pred - y) ** 2 / scale).mean()
 
 def build_optimizer(model, optim, lr):
     if optim=='adam':
@@ -154,27 +132,19 @@ def main(args):
         train_loader1 = DataLoader(train_dataset1, batch_size=args.batch_size, shuffle=False)
         train_loader2 = DataLoader(train_dataset2, batch_size=args.batch_size, shuffle=False)
             
-        gnn_model_dict = {
-            'GCN': GCNwoRegressor(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout),
-            'GAT': GATwoRegressor(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, heads=args.heads, dropout=args.dropout),
-            'GIN': GINwoRegressor(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout)
+        model_dict = {
+            'GCN': GCN(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout,  mlp_dropout=args.mlp_dropout, mlp_dims=mlp_dims),
         }
-
-        gnn_model = gnn_model_dict[args.model]
-        mlp_model = MLPReadout2(args.hidden_dim, 4, dims=mlp_dims, dropout=args.mlp_dropout)
-
-        model = Model(gnn_model, mlp_model)
-        model = model.to(device)
     
+        model = model_dict[args.model] 
+    
+        model = model.to(device)
         if args.model in ['simple', 'transformer']:
             optimizer = build_optimizer(model, 'sparseadam', args.lr) 
         else: 
             optimizer = build_optimizer(model, 'adam', args.lr)
         
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=lambda epoch: 0.95 ** epoch,
-                                        last_epoch=-1,
-                                        verbose=False)
+        criterion = nn.MSELoss()
 
         if not os.path.exists(f'./graphcl-{args.model}'):
             os.mkdir(f'./graphcl-{args.model}')
@@ -219,14 +189,13 @@ def main(args):
 
                     pred1 = model.forward(batch1)
                     pred2 = model.forward(batch2)     
-                    loss = loss_cl(pred1, pred2)
+                    loss = model.loss_cl(pred1, pred2)
 
                     training_loss.append(loss.item())
                     
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    # scheduler.step()
                 
                 print('[pre-train {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
 
@@ -237,27 +206,17 @@ def main(args):
                 dict2tsv(res, f'./graphcl-{args.model}/{model_path}/{args.seed}/logs_pretrain-{test_idx}.txt')
                 if (epoch+1)%100==0: 
                     torch.save(model.state_dict(), f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-{epoch+1}-{test_idx}.pth.tar')
-            torch.save(model.state_dict(), f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-{args.epochs}-{test_idx}.pth.tar')
+            torch.save(model.state_dict(), f'./graphcl-{args.model}/{model_path}/{args.seed}/pretrained-last-{test_idx}.pth.tar')
         ######
         # model = GCN(num_input_features=9, num_layers=3, hidden_dim=64, out_dim=64)
         # model = model.to(device)
         # model.load_state_dict(torch.load('./pretrained-{}.pth.tar'.format(test_idx)))
         total_test_iter = args.k_fold if args.k_fold is not None else 1 
-        gnn_model = model.gnn # pretrained 
-        mlp_model = MLPReadout2(args.hidden_dim, 4, dims=mlp_dims, dropout=args.mlp_dropout) # new weight 
-
-        model = Model(gnn_model, mlp_model)
-        model = model.to(device)
 
         if args.model in ['simple', 'transformer']:
             optimizer = build_optimizer(model, 'sparseadam', args.ft_lr) 
         else: 
             optimizer = build_optimizer(model, 'adam', args.ft_lr)
-        
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=lambda epoch: 0.95 ** epoch,
-                                        last_epoch=-1,
-                                        verbose=False)
 
         test_loss_sets, test_r2_sets, test_rmse_sets, test_mae_sets = [], [], [], []
         for k in range(total_test_iter):    
@@ -295,15 +254,13 @@ def main(args):
                     pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
                     pred = pred.squeeze(0)
 
-                    loss = mse(pred, y)
-                    # loss = scaled_l2(pred, y, y_mean)
+                    # loss = criterion(pred, y)
+                    loss = scaled_l2(pred, y, y_mean)
                     training_loss.append(loss.item())
                     
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    scheduler.step() 
-
                 print('[fine-tune {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
                 
                 res = collections.OrderedDict()
@@ -330,7 +287,7 @@ def main(args):
                     pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
                     pred = pred.squeeze(0)
 
-                    loss = mse(pred, y)
+                    loss = criterion(pred, y)
                     test_loss.append(loss.item())
                     ys.append(y.cpu().detach().numpy())
                     preds.append(pred.cpu().detach().numpy())

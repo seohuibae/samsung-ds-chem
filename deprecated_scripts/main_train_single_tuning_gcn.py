@@ -1,5 +1,5 @@
 '''
-code for single-heads + scaling 
+code for multi-heads + scaling 
 '''
 import os 
 import argparse
@@ -13,48 +13,43 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader as DataLoaderText
 from torch_geometric.data import DataLoader
 
-from models.gcn import GCN, GCNwoRegressor
-from models.gat import GAT, GATwoRegressor
-from models.gin import GIN, GINwoRegressor
-from models.model_utils import MLPReadout2
-from models.model import Model 
+from models.gcn import GCN, GCNwoFC
+from models.gat import GAT
+from models.gin import GIN 
 # from models.transformer import Transformer, SimpleTextClassificationModel
-from dataset import set_dataset
+from dataset import set_dataset, set_dataset_single_task
 
 from dataset import wrapper_for_collate_batch
 # from deepchem.feat.smiles_tokenizer import SmilesTokenizer, BasicSmilesTokenizer
-from utils import dict2tsv, singlepleOptimizer, set_seed
-from train_utils import scaled_l2, mse, loss_cl
+from utils import dict2tsv, MultipleOptimizer, set_seed
 
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 parser = argparse.ArgumentParser(description='PyTorch Training')
 
-parser.add_argument('--batch_size', default=64, type=int)
-parser.add_argument('--epochs', default=300, type=int)                   
-parser.add_argument('--ft_epochs', default=50, type=int)
-parser.add_argument('--lr', default=1e-3, type=float)
-parser.add_argument('--ft_lr', default=1e-3, type=float)
+parser.add_argument('--batch_size', default=64, type=int)                 
+parser.add_argument('--epochs', default=100, type=int) 
+parser.add_argument('--lr', default=1e-03, type=float) # ~1e-03 
 parser.add_argument('--l2reg', default=1e-03, type=float) # 1e-02~1e-03 
-parser.add_argument('--model', default='GCN', type=str, choices=['simple','transformer', 'GCN', 'GAT', 'GIN'])
+parser.add_argument('--model', default='GCN', type=str, choices=['simple','transformer', 'GCN', 'GCNwoFC', 'GAT', 'GIN'])
 parser.add_argument('--gpu', default=0, type=int) # 0,1,2,3,
-parser.add_argument('--finetune_only', action='store_true' )
-# parser.add_argument('--tuning', action='store_true')
+# parser.add_argument('--finetune_only', action='store_true' )
+parser.add_argument('--tuning', action='store_true')
 parser.add_argument('--k_fold', default=None, type=int) # 5 
 parser.add_argument('--seed', default=2020, type=int)
 
 # model related
 # parser.add_argument('--model_path', type=str, required=True)
-parser.add_argument('--exp', type=str, default='')
 parser.add_argument('--num_layers', type=int, required=True)
 parser.add_argument('--hidden_dim', type=int, required=True)
-parser.add_argument('--heads', type=int, default=1) 
+#parser.add_argument('--heads', type=int, required=True)
 parser.add_argument('--dropout', type=float, required=True)
 parser.add_argument('--mlp_dropout', required=True)
 parser.add_argument('--mlp_dims', required=True)
-parser.add_argument('--bn', action='store_true')
 args = parser.parse_args()
 
+# assert args.tuning 
+# parsing
 if args.mlp_dropout=='None': 
     args.mlp_dropout = None 
 else: 
@@ -70,26 +65,19 @@ if args.l2reg=='None':
 else: 
     args.l2reg = float(args.l2reg)
 
+if 'woFC' in args.model:    
+    assert args.mlp_dropout is None
+else: 
+    assert args.mlp_dropout is not None 
 
-# assert args.tuning 
 device = torch.device("cuda:"+str(args.gpu) if torch.cuda.is_available() else "cpu")
 
 def scaled_l2(pred, y, scale):
     return ((pred - y) ** 2 / scale).mean()
 
-def build_optimizer(model, optim, lr, reg='all'): # reg: all, fc, gnn
+def build_optimizer(model, optim, lr):
     if optim=='adam':
-        if reg == 'fc':
-            optimizer = torch.optim.Adam([
-                {'params':model.base_params()},
-                {'params':model.classifier_params(), 'weight_decay': args.l2reg}], lr=lr)
-        elif reg == 'gnn':
-            optimizer = torch.optim.Adam([
-                {'params':model.base_params(), 'weight_decay': args.l2reg},
-                {'params':model.classifier_params()}], lr=lr)
-        else:
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=args.l2reg)
-        
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=args.l2reg)
     elif optim == 'sparseadam':
         dense = []
         sparse = []
@@ -101,7 +89,7 @@ def build_optimizer(model, optim, lr, reg='all'): # reg: all, fc, gnn
                 sparse.append(param)
             else:
                 dense.append(param)
-        optimizer = singlepleOptimizer(
+        optimizer = MultipleOptimizer(
             [torch.optim.Adam(
                 dense,
                 lr=lr, weight_decay=args.l2reg),
@@ -113,11 +101,13 @@ def build_optimizer(model, optim, lr, reg='all'): # reg: all, fc, gnn
     return optimizer
 
 
+
 def main(args):
     
     set_seed(args.seed, use_cuda=True)
 
     for test_idx in range(4):
+        print(f'idx: {test_idx}')
         
         # vocab_rootdir='./vocab/'
         # vocab_path = os.path.join(vocab_rootdir,'vocab.txt')
@@ -125,46 +115,25 @@ def main(args):
         
         ### TODO 5-fold 
         if args.model in ['simple', 'transformer']:
-            train_dataset, test_sets = set_dataset(root='./polyinfo/raw', test_idx=test_idx, use_smiles_only=True, k_fold=args.k_fold) 
+            _, test_sets = set_dataset_single_task(root='./polyinfo/raw', test_idx=test_idx, use_smiles_only=True, k_fold=args.k_fold) 
         else: 
-            train_dataset, test_sets = set_dataset(root='./polyinfo/raw', test_idx=test_idx, k_fold=args.k_fold)
+            _, test_sets = set_dataset_single_task(root='./polyinfo/raw', test_idx=test_idx, k_fold=args.k_fold)
 
-        if args.model in ['simple', 'transformer']:
-            train_loader = DataLoaderText(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=wrapper_for_collate_batch(tokenizer))
-        else:
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-            
-        gnn_model_dict = {
-            'GCN': GCNwoRegressor(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout),
-            'GAT': GATwoRegressor(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, heads=args.heads, dropout=args.dropout),
-            'GIN': GINwoRegressor(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout)
+        model_dict = {
+            'GCNwoFC': GCNwoFC(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=4, dropout=args.dropout, mlp_dropout=None),
+            'GCN': GCN(num_input_features=9, num_layers=args.num_layers, hidden_dim=args.hidden_dim, out_dim=args.hidden_dim, dropout=args.dropout, mlp_dropout=args.mlp_dropout, mlp_dims=mlp_dims),
         }
-        gnn_model = gnn_model_dict[args.model]
-        mlp_model = MLPReadout2(args.hidden_dim, 4, dims=mlp_dims, dropout=args.mlp_dropout)
-
-        model = Model(gnn_model, mlp_model)
+    
+        model = model_dict[args.model] 
         model = model.to(device)
-        
-        if args.model in ['simple', 'transformer']:
-            optimizer = build_optimizer(model, 'sparseadam', args.lr) 
-        else: 
-            reg = 'all'
-            optimizer = build_optimizer(model, 'adam', args.lr, reg=reg) 
-        
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=lambda epoch: 0.95 ** epoch,
-                                        last_epoch=-1,
-                                        verbose=False)
+
+
+        criterion = nn.MSELoss()
         
         if not os.path.exists(f'./single-{args.model}'):
             os.mkdir(f'./single-{args.model}')
 
-        # model_path = []
-        # for k,v in hparams.items():
-        #     model_path.append(str(k)+str(v))
-        # model_path = '-'.join(model_path)
-        # model_path = args.model_path
-        hparams = {'nlayers': args.num_layers, 'dim': args.hidden_dim,'lr': args.lr, 'ft_lr':args.ft_lr, 'dropout': args.dropout, 'mlp_dropout': args.mlp_dropout, 'mlp_dims': args.mlp_dims,'kfold': args.k_fold}
+        hparams = {'nlayers': args.num_layers, 'dim': args.hidden_dim,'lr': args.lr, 'dropout': args.dropout, 'mlp_dropout': args.mlp_dropout, 'mlp_dims': args.mlp_dims,'kfold': args.k_fold}
         model_path = []
         for k,v in hparams.items():
             model_path.append(str(k)+str(v))
@@ -172,84 +141,28 @@ def main(args):
         if args.l2reg is not None: 
             model_path += f'-l2reg{args.l2reg}'
         print(model_path)
-
+        
+        # model_path = args.model_path
 
         if not os.path.exists(f'./single-{args.model}/{model_path}'):
             os.mkdir(f'./single-{args.model}/{model_path}')
         if not os.path.exists(f'./single-{args.model}/{model_path}/{args.seed}'):
             os.mkdir(f'./single-{args.model}/{model_path}/{args.seed}')
             
-        # pre-train 
-        print(args.finetune_only)
-        if args.finetune_only:
-            print('load pre-trained model')
-            model.load_state_dict(torch.load(f'./single-{args.model}/{model_path}/{args.seed}/pretrained-{test_idx}.pth.tar'))
-        else: 
-            for epoch in range(args.epochs):
-                model.train()
-
-                training_loss = []
-                for batch in tqdm(train_loader):
-                    if args.model in ['simple', 'transformer']:
-                        cls, text, offsets = batch 
-                        cls, text, offsets = cls.to(device), text.to(device), offsets.to(device)
-                        bsz = len(cls)
-                        pred = model(text, offsets)
-                        _y = cls
-    
-                    else: 
-                        bsz = batch.num_graphs
-                        batch.to(device)  
-                        pred = model(batch)        
-                        _y = batch.y                           # pred: [bsz, 4]
-                    
-                    y  = torch.tensor([val[0] for val in _y]).float().to(device)
-                    y_idx = torch.tensor([val[1] for val in _y]).long().to(device)
-                    y_mean  = torch.tensor([val[2] for val in _y]).float().to(device)
-                    # y_std  = torch.tensor([val[3] for val in batch.y]).float()
-                    if args.model == 'transformer':
-                        pred = pred.view(-1, 4)
-                    pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
-                    pred = pred.squeeze(0)
-
-                    loss = scaled_l2(pred, y, y_mean)
-                    # loss = mse(pred, y)
-                    training_loss.append(loss.item())
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    scheduler.step()
-                
-                print('[pre-train {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
-
-                res = collections.OrderedDict()
-                res['epoch'] = epoch
-                res['loss'] = np.mean(training_loss)
-                # print(res)
-                dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_pretrain-{test_idx}.txt')
-            torch.save(model.state_dict(), f'./single-{args.model}/{model_path}/{args.seed}/pretrained-{test_idx}.pth.tar')
             
         ######
         # model = GCN(num_input_features=9, num_layers=3, hidden_dim=64, out_dim=64)
         # model = model.to(device)
         # model.load_state_dict(torch.load('./pretrained-{}.pth.tar'.format(test_idx)))
-        total_test_iter = args.k_fold if args.k_fold is not None else 1 
-        gnn_model = model.gnn # pretrained 
-        mlp_model = MLPReadout2(args.hidden_dim, 4, dims=mlp_dims, dropout=args.mlp_dropout) # new weight 
-
-        model = Model(gnn_model, mlp_model)
-        model = model.to(device)
-
         if args.model in ['simple', 'transformer']:
-            optimizer = build_optimizer(model, 'sparseadam', args.ft_lr) 
+            optimizer = build_optimizer(model, 'sparseadam', args.lr) 
         else: 
-            optimizer = build_optimizer(model, 'adam', args.ft_lr, reg=reg)
+            optimizer = build_optimizer(model, 'adam', args.lr)
+
+
+        total_test_iter = args.k_fold if args.k_fold is not None else 1 
+
         
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=lambda epoch: 0.95 ** epoch,
-                                        last_epoch=-1,
-                                        verbose=False)
 
         test_loss_sets, test_r2_sets, test_rmse_sets, test_mae_sets = [], [], [], []
         for k in range(total_test_iter):    
@@ -262,9 +175,10 @@ def main(args):
             else: 
                 ft_loader = DataLoader(ft_dataset, batch_size=args.batch_size, shuffle=True)
                 test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
-            # fine-tune
-            for epoch in range(args.ft_epochs):
+            
+            # train
+            for epoch in range(args.epochs):
+                
                 model.train()
                 training_loss = []
                 for batch in tqdm(ft_loader):
@@ -290,20 +204,18 @@ def main(args):
                     pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
                     pred = pred.squeeze(0)
 
-                    # loss = mse(pred, y)
-                    loss = scaled_l2(pred, y, y_mean)
+                    loss = criterion(pred, y)
                     training_loss.append(loss.item())
                     
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    scheduler.step()
-                print('[fine-tune {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
+                print('[train {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
                 
                 res = collections.OrderedDict()
                 res['epoch'] = epoch
                 res['loss'] = np.mean(training_loss)
-                dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_finetune-{test_idx}.txt')
+                dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_train-{test_idx}.txt')
             
             # test 
             model.eval()
@@ -334,12 +246,15 @@ def main(args):
                     pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
                     pred = pred.squeeze(0)
 
-                    loss = mse(pred, y)
+                    loss = criterion(pred, y)
                     test_loss.append(loss.item())
                     ys.append(y.cpu().detach().numpy())
                     preds.append(pred.cpu().detach().numpy())
             ys = np.concatenate(ys)
             preds = np.concatenate(preds)
+            # print(ys)
+            # print(preds)
+            # input()
 
             test_loss = np.mean(test_loss)
             test_r2 = r2_score(ys, preds)
@@ -370,6 +285,6 @@ def main(args):
 
         dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_test-{test_idx}.txt')
 
-    print(args.exp)
+
 if __name__ == '__main__':
     main(args)
