@@ -64,6 +64,7 @@ class GINwoRegressor(torch.nn.Module):
                             nn.Linear(hidden_dim, out_dim), nn.ReLU())))
 
         # self.mlp_head = MLPReadout(out_dim, 4, L=2, dropout=mlp_dropout)
+        self.linears = nn.Sequential(nn.Linear(out_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim))
     
     def forward(self, data):
         """ data.x: (num_nodes, num_features)"""
@@ -83,7 +84,8 @@ class GINwoRegressor(torch.nn.Module):
         elif self.readout == 'mean':
             x = global_mean_pool(x, batch)
         # pred = self.mlp_head(x)
-        pred = x 
+        pred = self.linears(x)
+        # pred = x 
 
         return pred
     

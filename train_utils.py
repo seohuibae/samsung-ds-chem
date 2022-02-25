@@ -1,6 +1,7 @@
 import torch 
 import torch.nn as nn 
 import torch.nn.functional as F 
+from utils import  MultipleOptimizer
 
 def scaled_l2(pred, y, scale):
     return ((pred - y) ** 2 / scale).mean()
@@ -22,3 +23,38 @@ def loss_cl(x1, x2):
     loss = - torch.log(loss).mean()
 
     return loss
+
+def build_optimizer(model, optim, lr, weight_decay, reg='all'): # reg: all, fc, gnn
+    if optim=='adam':
+        if reg == 'fc':
+            optimizer = torch.optim.Adam([
+                {'params':model.base_params()},
+                {'params':model.classifier_params(), 'weight_decay': weight_decay}], lr=lr)
+        elif reg == 'gnn':
+            optimizer = torch.optim.Adam([
+                {'params':model.base_params(), 'weight_decay': weight_decay},
+                {'params':model.classifier_params()}], lr=lr)
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        
+    elif optim == 'sparseadam':
+        dense = []
+        sparse = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # TODO: Find a better way to check for sparse gradients.
+            if 'embed' in name:
+                sparse.append(param)
+            else:
+                dense.append(param)
+        optimizer = MultipleOptimizer(
+            [torch.optim.Adam(
+                dense,
+                lr=lr, weight_decay=weight_decay),
+            torch.optim.SparseAdam(
+                sparse,
+                lr=lr, weight_decay=weight_decay)])
+    else:
+        raise NotImplementedError
+    return optimizer

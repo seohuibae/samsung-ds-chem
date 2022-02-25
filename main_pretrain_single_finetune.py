@@ -24,7 +24,7 @@ from dataset import set_dataset
 from dataset import wrapper_for_collate_batch
 # from deepchem.feat.smiles_tokenizer import SmilesTokenizer, BasicSmilesTokenizer
 from utils import dict2tsv, singlepleOptimizer, set_seed
-from train_utils import scaled_l2, mse, loss_cl
+from train_utils import scaled_l2, mse, loss_cl, build_optimizer
 
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
@@ -35,13 +35,14 @@ parser.add_argument('--epochs', default=300, type=int)
 parser.add_argument('--ft_epochs', default=50, type=int)
 parser.add_argument('--lr', default=1e-3, type=float)
 parser.add_argument('--ft_lr', default=1e-3, type=float)
-parser.add_argument('--l2reg', default=1e-03, type=float) # 1e-02~1e-03 
+parser.add_argument('--weight_decay', default=1e-03, type=float) # 1e-02~1e-03 
 parser.add_argument('--model', default='GCN', type=str, choices=['simple','transformer', 'GCN', 'GAT', 'GIN'])
 parser.add_argument('--gpu', default=0, type=int) # 0,1,2,3,
 parser.add_argument('--finetune_only', action='store_true' )
 # parser.add_argument('--tuning', action='store_true')
 parser.add_argument('--k_fold', default=None, type=int) # 5 
 parser.add_argument('--seed', default=2020, type=int)
+parser.add_argument('--patience', default=-1) # -1 if no early stop 
 
 # model related
 # parser.add_argument('--model_path', type=str, required=True)
@@ -52,7 +53,7 @@ parser.add_argument('--heads', type=int, default=1)
 parser.add_argument('--dropout', type=float, required=True)
 parser.add_argument('--mlp_dropout', required=True)
 parser.add_argument('--mlp_dims', required=True)
-parser.add_argument('--bn', action='store_true')
+# parser.add_argument('--bn', action='store_true')
 args = parser.parse_args()
 
 if args.mlp_dropout=='None': 
@@ -65,53 +66,14 @@ else:
     mlp_dims = args.mlp_dims.split('-')
     mlp_dims = [int(k) for k in mlp_dims]
 
-if args.l2reg=='None': 
-    args.l2reg = None 
+if args.weight_decay=='None': 
+    args.weight_decay = None 
 else: 
-    args.l2reg = float(args.l2reg)
+    args.weight_decay = float(args.weight_decay)
 
 
 # assert args.tuning 
 device = torch.device("cuda:"+str(args.gpu) if torch.cuda.is_available() else "cpu")
-
-def scaled_l2(pred, y, scale):
-    return ((pred - y) ** 2 / scale).mean()
-
-def build_optimizer(model, optim, lr, reg='all'): # reg: all, fc, gnn
-    if optim=='adam':
-        if reg == 'fc':
-            optimizer = torch.optim.Adam([
-                {'params':model.base_params()},
-                {'params':model.classifier_params(), 'weight_decay': args.l2reg}], lr=lr)
-        elif reg == 'gnn':
-            optimizer = torch.optim.Adam([
-                {'params':model.base_params(), 'weight_decay': args.l2reg},
-                {'params':model.classifier_params()}], lr=lr)
-        else:
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=args.l2reg)
-        
-    elif optim == 'sparseadam':
-        dense = []
-        sparse = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            # TODO: Find a better way to check for sparse gradients.
-            if 'embed' in name:
-                sparse.append(param)
-            else:
-                dense.append(param)
-        optimizer = singlepleOptimizer(
-            [torch.optim.Adam(
-                dense,
-                lr=lr, weight_decay=args.l2reg),
-            torch.optim.SparseAdam(
-                sparse,
-                lr=lr, weight_decay=args.l2reg)])
-    else:
-        raise NotImplementedError
-    return optimizer
-
 
 def main(args):
     
@@ -146,45 +108,56 @@ def main(args):
         model = model.to(device)
         
         if args.model in ['simple', 'transformer']:
-            optimizer = build_optimizer(model, 'sparseadam', args.lr) 
+            optimizer = build_optimizer(model, 'sparseadam', args.lr, args.weight_decay) 
         else: 
             reg = 'all'
-            optimizer = build_optimizer(model, 'adam', args.lr, reg=reg) 
+            optimizer = build_optimizer(model, 'adam', args.lr,args.weight_decay, reg=reg) 
         
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=lambda epoch: 0.95 ** epoch,
-                                        last_epoch=-1,
-                                        verbose=False)
+        # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
+        #                                 lr_lambda=lambda epoch: 0.95 ** epoch,
+        #                                 last_epoch=-1,
+        #                                 verbose=False)
         
-        if not os.path.exists(f'./single-{args.model}'):
-            os.mkdir(f'./single-{args.model}')
+        if not os.path.exists(f'./single-{args.model}-pretrain'):
+            os.mkdir(f'./single-{args.model}-pretrain')
+        if not os.path.exists(f'./single-{args.model}-finetune'):
+            os.mkdir(f'./single-{args.model}-finetune')
 
-        # model_path = []
-        # for k,v in hparams.items():
-        #     model_path.append(str(k)+str(v))
-        # model_path = '-'.join(model_path)
-        # model_path = args.model_path
-        hparams = {'nlayers': args.num_layers, 'dim': args.hidden_dim,'lr': args.lr, 'ft_lr':args.ft_lr, 'dropout': args.dropout, 'mlp_dropout': args.mlp_dropout, 'mlp_dims': args.mlp_dims,'kfold': args.k_fold}
+        pretrain_hparams = {'nlayers': args.num_layers, 'dim': args.hidden_dim,'lr': args.lr, 'dropout': args.dropout, 'weight_decay': args.weight_decay, 'aug1': args.aug1, 'aug_ratio1': args.aug_ratio1, 'aug2': args.aug2, 'aug_ratio2': args.aug_ratio2, 'weight_decay': args.weight_decay}
+        hparams = {'ft_lr': args.ft_lr, 'mlp_dropout': args.mlp_dropout, 'mlp_dims': args.mlp_dims,'kfold': args.k_fold,}
+        
+        pretrain_model_path = []
+        for k,v in pretrain_hparams.items():
+            pretrain_model_path.append(str(k)+str(v))
+        pretrain_model_path = '-'.join(pretrain_model_path)
         model_path = []
         for k,v in hparams.items():
             model_path.append(str(k)+str(v))
         model_path = '-'.join(model_path)
-        if args.l2reg is not None: 
-            model_path += f'-l2reg{args.l2reg}'
+
+        model_path = pretrain_model_path + model_path 
+        model_path += args.exp
+
         print(model_path)
 
-
-        if not os.path.exists(f'./single-{args.model}/{model_path}'):
-            os.mkdir(f'./single-{args.model}/{model_path}')
-        if not os.path.exists(f'./single-{args.model}/{model_path}/{args.seed}'):
-            os.mkdir(f'./single-{args.model}/{model_path}/{args.seed}')
-            
+        if not os.path.exists(f'./single-{args.model}-pretrain/{pretrain_model_path}'):
+            os.mkdir(f'./single-{args.model}-pretrain/{pretrain_model_path}')
+        if not os.path.exists(f'./single-{args.model}-pretrain/{pretrain_model_path}/{args.seed}'):
+            os.mkdir(f'./single-{args.model}-pretrain/{pretrain_model_path}/{args.seed}')
+        
+        if not os.path.exists(f'./single-{args.model}-finetune/{model_path}'):
+            os.mkdir(f'./single-{args.model}-finetune/{model_path}')
+        if not os.path.exists(f'./single-{args.model}-finetune/{model_path}/{args.seed}'):
+            os.mkdir(f'./single-{args.model}-finetune/{model_path}/{args.seed}')
+        
+        #####
         # pre-train 
         print(args.finetune_only)
         if args.finetune_only:
             print('load pre-trained model')
-            model.load_state_dict(torch.load(f'./single-{args.model}/{model_path}/{args.seed}/pretrained-{test_idx}.pth.tar'))
+            model.load_state_dict(torch.load(f'./single-{args.model}-pretrain/{pretrain_model_path}/{args.seed}/pretrained-{args.epochs}-{test_idx}.pth.tar'))
         else: 
+            print('start pre-training')
             for epoch in range(args.epochs):
                 model.train()
 
@@ -219,7 +192,9 @@ def main(args):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    scheduler.step()
+
+                    # if epoch > 100:
+                    #     scheduler.step() # no scheduling was better 
                 
                 print('[pre-train {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
 
@@ -227,9 +202,11 @@ def main(args):
                 res['epoch'] = epoch
                 res['loss'] = np.mean(training_loss)
                 # print(res)
-                dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_pretrain-{test_idx}.txt')
-            torch.save(model.state_dict(), f'./single-{args.model}/{model_path}/{args.seed}/pretrained-{test_idx}.pth.tar')
-            
+                dict2tsv(res, f'./single-{args.model}-pretrain/{pretrain_model_path}/{args.seed}/logs_pretrain-{test_idx}.txt')
+                if (epoch+1)%20==0: 
+                    torch.save(model.state_dict(), f'./single-{args.model}-pretrain/{pretrain_model_path}/{args.seed}/pretrained-{epoch+1}-{test_idx}.pth.tar')          
+            torch.save(model.state_dict(), f'./single-{args.model}-pretrain/{pretrain_model_path}/{args.seed}/pretrained-{args.epochs}-{test_idx}.pth.tar')
+
         ######
         # model = GCN(num_input_features=9, num_layers=3, hidden_dim=64, out_dim=64)
         # model = model.to(device)
@@ -242,14 +219,16 @@ def main(args):
         model = model.to(device)
 
         if args.model in ['simple', 'transformer']:
-            optimizer = build_optimizer(model, 'sparseadam', args.ft_lr) 
+            optimizer = build_optimizer(model, 'sparseadam', args.ft_lr, args.weight_decay) 
         else: 
-            optimizer = build_optimizer(model, 'adam', args.ft_lr, reg=reg)
+            optimizer = build_optimizer(model, 'adam', args.ft_lr,args.weight_decay, reg=reg)
         
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=lambda epoch: 0.95 ** epoch,
-                                        last_epoch=-1,
-                                        verbose=False)
+        # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,
+        #                                 lr_lambda=lambda epoch: 0.95 ** epoch,
+        #                                 last_epoch=-1,
+        #                                 verbose=False)
+        # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
 
         test_loss_sets, test_r2_sets, test_rmse_sets, test_mae_sets = [], [], [], []
         for k in range(total_test_iter):    
@@ -264,6 +243,9 @@ def main(args):
                 test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
             # fine-tune
+            test_loss = []
+            ys = []
+            preds = []
             for epoch in range(args.ft_epochs):
                 model.train()
                 training_loss = []
@@ -297,47 +279,46 @@ def main(args):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    scheduler.step()
+                    
                 print('[fine-tune {}-epoch] train loss:{:.5f} '.format(epoch+1, np.mean(training_loss)))
                 
                 res = collections.OrderedDict()
                 res['epoch'] = epoch
                 res['loss'] = np.mean(training_loss)
-                dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_finetune-{test_idx}.txt')
+                dict2tsv(res, f'./single-{args.model}-finetune/{model_path}/{args.seed}/logs_finetune-{test_idx}.txt')
             
-            # test 
-            model.eval()
-            test_loss = []
-            ys = []
-            preds = []
-            with torch.no_grad():
-                for batch in tqdm(test_loader):
-                    if args.model in ['simple', 'transformer']:
-                        cls, text, offsets = batch 
-                        cls, text, offsets = cls.to(device), text.to(device), offsets.to(device)
-                        bsz = len(cls)
-                        pred = model(text, offsets)                    
-                        _y = cls
+                # test 
+                model.eval()
+                with torch.no_grad():
+                    for batch in tqdm(test_loader):
+                        if args.model in ['simple', 'transformer']:
+                            cls, text, offsets = batch 
+                            cls, text, offsets = cls.to(device), text.to(device), offsets.to(device)
+                            bsz = len(cls)
+                            pred = model(text, offsets)                    
+                            _y = cls
 
-                    else: 
-                        bsz = batch.num_graphs
-                        batch.to(device)  
-                        pred = model(batch)        
-                        _y = batch.y                           # pred: [bsz, 4]
+                        else: 
+                            bsz = batch.num_graphs
+                            batch.to(device)  
+                            pred = model(batch)        
+                            _y = batch.y                           # pred: [bsz, 4]
+                        
+                        y  = torch.tensor([val[0] for val in _y]).float().to(device)
+                        y_idx = torch.tensor([val[1] for val in _y]).long().to(device)
+
+                        if args.model == 'transformer':
+                            pred = pred.view(-1, 4)
                     
-                    y  = torch.tensor([val[0] for val in _y]).float().to(device)
-                    y_idx = torch.tensor([val[1] for val in _y]).long().to(device)
+                        pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
+                        pred = pred.squeeze(0)
 
-                    if args.model == 'transformer':
-                        pred = pred.view(-1, 4)
-                
-                    pred = pred[torch.arange(bsz).view(1,-1), y_idx]    
-                    pred = pred.squeeze(0)
+                        loss = mse(pred, y)
+                        test_loss.append(loss.item())
+                        ys.append(y.cpu().detach().numpy())
+                        preds.append(pred.cpu().detach().numpy())
+                scheduler.step(loss.item()) # scheduling 
 
-                    loss = mse(pred, y)
-                    test_loss.append(loss.item())
-                    ys.append(y.cpu().detach().numpy())
-                    preds.append(pred.cpu().detach().numpy())
             ys = np.concatenate(ys)
             preds = np.concatenate(preds)
 
@@ -368,8 +349,8 @@ def main(args):
         res['rmse'] = np.mean(test_rmse_sets)
         res['mae'] = np.mean(test_mae_sets) 
 
-        dict2tsv(res, f'./single-{args.model}/{model_path}/{args.seed}/logs_test-{test_idx}.txt')
+        dict2tsv(res, f'./single-{args.model}-finetune/{model_path}/{args.seed}/logs_test-{test_idx}.txt')
+    print(model_path)
 
-    print(args.exp)
 if __name__ == '__main__':
     main(args)
